@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.pyo
 .env
 .env.*
 !.env.example
@@ -9,3 +10,4 @@ venv/
 *.md
 tests/
 .DS_Store
+data/landing/

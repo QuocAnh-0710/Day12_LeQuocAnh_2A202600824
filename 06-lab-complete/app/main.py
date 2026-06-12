@@ -1,38 +1,40 @@
 """
-Production AI Agent — Kết hợp tất cả Day 12 concepts
+DrugLaw RAG Agent — Production FastAPI
 
-Checklist:
+Day 8 RAG chatbot (luật ma tuý Việt Nam) productionized với Day 12 patterns:
   ✅ Config từ environment (12-factor)
   ✅ Structured JSON logging
   ✅ API Key authentication
-  ✅ Rate limiting
-  ✅ Cost guard
-  ✅ Input validation (Pydantic)
+  ✅ Rate limiting (10 req/min per user)
+  ✅ Cost guard ($10/month per user)
   ✅ Health check + Readiness probe
-  ✅ Graceful shutdown
+  ✅ Graceful shutdown (SIGTERM)
+  ✅ Stateless: conversation history in Redis
   ✅ Security headers
   ✅ CORS
-  ✅ Error handling
 """
-import os
+import sys
 import time
 import signal
 import logging
 import json
+from pathlib import Path
 from datetime import datetime, timezone
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
-from fastapi.security.api_key import APIKeyHeader
+# Đảm bảo src/ được tìm thấy khi chạy từ /app trong container
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import redis as redis_module
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
 from app.config import settings
-
-# Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
-from utils.mock_llm import ask as llm_ask
+from app.auth import verify_api_key
+from app.rate_limiter import check_rate_limit
+from app.cost_guard import check_budget, record_usage, get_usage
 
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
@@ -49,52 +51,42 @@ _request_count = 0
 _error_count = 0
 
 # ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
+# RAG Supervisor (lazy init — nặng, chỉ load 1 lần)
 # ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
+_supervisor = None
 
-def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
+
+def get_supervisor():
+    global _supervisor
+    if _supervisor is None:
+        from src.agent.supervisor import Supervisor
+        _supervisor = Supervisor()
+        logger.info(json.dumps({"event": "supervisor_loaded"}))
+    return _supervisor
+
 
 # ─────────────────────────────────────────────────────────
-# Simple Cost Guard
+# Redis — optional, graceful fallback
 # ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
+_redis_client = None
 
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
 
-# ─────────────────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+def get_redis():
+    global _redis_client
+    if not settings.redis_url:
+        return None
+    try:
+        if _redis_client is None:
+            _redis_client = redis_module.from_url(
+                settings.redis_url,
+                decode_responses=True,
+                socket_connect_timeout=2,
+            )
+        _redis_client.ping()
+        return _redis_client
+    except Exception:
+        return None
 
-def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    if not api_key or api_key != settings.agent_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
-        )
-    return api_key
 
 # ─────────────────────────────────────────────────────────
 # Lifespan
@@ -108,7 +100,20 @@ async def lifespan(app: FastAPI):
         "version": settings.app_version,
         "environment": settings.environment,
     }))
-    time.sleep(0.1)  # simulate init
+
+    # Pre-load RAG supervisor để request đầu tiên không bị chậm
+    try:
+        get_supervisor()
+        logger.info(json.dumps({"event": "rag_pipeline_ready"}))
+    except Exception as e:
+        logger.error(json.dumps({"event": "rag_pipeline_error", "error": str(e)}))
+
+    r = get_redis()
+    logger.info(json.dumps({
+        "event": "redis_status",
+        "connected": r is not None,
+    }))
+
     _is_ready = True
     logger.info(json.dumps({"event": "ready"}))
 
@@ -117,12 +122,14 @@ async def lifespan(app: FastAPI):
     _is_ready = False
     logger.info(json.dumps({"event": "shutdown"}))
 
+
 # ─────────────────────────────────────────────────────────
 # App
 # ─────────────────────────────────────────────────────────
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
+    description="RAG chatbot về pháp luật ma tuý Việt Nam và tin tức nghệ sĩ liên quan.",
     lifespan=lifespan,
     docs_url="/docs" if settings.environment != "production" else None,
     redoc_url=None,
@@ -135,6 +142,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
+
 @app.middleware("http")
 async def request_middleware(request: Request, call_next):
     global _request_count, _error_count
@@ -142,7 +150,6 @@ async def request_middleware(request: Request, call_next):
     _request_count += 1
     try:
         response: Response = await call_next(request)
-        # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers.pop("server", None)
@@ -155,22 +162,38 @@ async def request_middleware(request: Request, call_next):
             "ms": duration,
         }))
         return response
-    except Exception as e:
+    except Exception:
         _error_count += 1
         raise
+
 
 # ─────────────────────────────────────────────────────────
 # Models
 # ─────────────────────────────────────────────────────────
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000,
-                          description="Your question for the agent")
+                          description="Câu hỏi về luật ma tuý hoặc tin tức nghệ sĩ")
+    user_id: str = Field(default="anonymous", max_length=64,
+                         description="User ID để track lịch sử và budget")
+    top_k: int = Field(default=5, ge=1, le=10,
+                       description="Số chunks tối đa đưa vào context")
+
+
+class SourceDoc(BaseModel):
+    content: str
+    score: float
+    source: str
+    doc_type: str
+
 
 class AskResponse(BaseModel):
     question: str
     answer: str
-    model: str
+    sources: list[SourceDoc]
+    retrieval_source: str
+    user_id: str
     timestamp: str
+
 
 # ─────────────────────────────────────────────────────────
 # Endpoints
@@ -182,10 +205,12 @@ def root():
         "app": settings.app_name,
         "version": settings.app_version,
         "environment": settings.environment,
+        "description": "RAG chatbot — luật ma tuý Việt Nam & tin tức nghệ sĩ",
         "endpoints": {
             "ask": "POST /ask (requires X-API-Key)",
             "health": "GET /health",
             "ready": "GET /ready",
+            "docs": "GET /docs (dev only)",
         },
     }
 
@@ -197,70 +222,126 @@ async def ask_agent(
     _key: str = Depends(verify_api_key),
 ):
     """
-    Send a question to the AI agent.
+    Gửi câu hỏi về pháp luật ma tuý hoặc nghệ sĩ liên quan.
 
-    **Authentication:** Include header `X-API-Key: <your-key>`
+    **Authentication:** Header `X-API-Key: <your-key>`
+
+    **Ví dụ câu hỏi:**
+    - Hình phạt tàng trữ heroin theo Điều 249 là bao nhiêu năm tù?
+    - Ca sĩ Chi Dân bị đề nghị truy tố về tội gì?
+    - Luật Phòng chống ma tuý 2021 nghiêm cấm những hành vi nào?
     """
     # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
+    check_rate_limit(_key[:8])
 
-    # Budget check
-    input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
+    # Monthly budget check per user
+    check_budget(body.user_id)
+
+    # Load conversation history từ Redis (stateless design)
+    r = get_redis()
+    conversation_history = []
+    if r:
+        try:
+            raw = r.lrange(f"history:{body.user_id}", -4, -1)
+            conversation_history = [json.loads(h) for h in raw if h]
+        except Exception:
+            pass
 
     logger.info(json.dumps({
-        "event": "agent_call",
+        "event": "rag_call",
+        "user_id": body.user_id,
         "q_len": len(body.question),
+        "top_k": body.top_k,
+        "history_len": len(conversation_history),
         "client": str(request.client.host) if request.client else "unknown",
     }))
 
-    answer = llm_ask(body.question)
+    # Gọi RAG Supervisor
+    try:
+        supervisor = get_supervisor()
+        result = supervisor.run(
+            query=body.question,
+            top_k=body.top_k,
+            conversation_history=conversation_history if conversation_history else None,
+        )
+    except Exception as e:
+        logger.error(json.dumps({"event": "rag_error", "error": str(e)}))
+        raise HTTPException(status_code=500, detail=f"RAG pipeline error: {str(e)}")
 
+    answer = result.get("answer", "Không tìm thấy thông tin liên quan.")
+    raw_sources = result.get("sources", [])
+    retrieval_source = result.get("retrieval_source", "hybrid")
+
+    # Record token usage (ước tính cho cost guard)
+    input_tokens = len(body.question.split()) * 2
     output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
+    record_usage(body.user_id, input_tokens, output_tokens)
+
+    # Lưu conversation history vào Redis
+    if r:
+        try:
+            r.rpush(f"history:{body.user_id}",
+                    json.dumps({"role": "user", "content": body.question}))
+            r.rpush(f"history:{body.user_id}",
+                    json.dumps({"role": "assistant", "content": answer[:500]}))
+            r.expire(f"history:{body.user_id}", 86400)
+        except Exception:
+            pass
+
+    # Format sources
+    sources = []
+    for s in raw_sources:
+        meta = s.get("metadata", {})
+        sources.append(SourceDoc(
+            content=s.get("content", "")[:300],
+            score=round(s.get("score", 0.0), 4),
+            source=meta.get("source", "unknown"),
+            doc_type=meta.get("type", "unknown"),
+        ))
 
     return AskResponse(
         question=body.question,
         answer=answer,
-        model=settings.llm_model,
+        sources=sources,
+        retrieval_source=retrieval_source,
+        user_id=body.user_id,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
 
 @app.get("/health", tags=["Operations"])
 def health():
-    """Liveness probe. Platform restarts container if this fails."""
-    status = "ok"
-    checks = {"llm": "mock" if not settings.openai_api_key else "openai"}
+    """Liveness probe. Platform restarts container nếu fail."""
     return {
-        "status": status,
+        "status": "ok",
         "version": settings.app_version,
         "environment": settings.environment,
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
-        "checks": checks,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.get("/ready", tags=["Operations"])
 def ready():
-    """Readiness probe. Load balancer stops routing here if not ready."""
+    """Readiness probe. Load balancer ngừng routing nếu not ready."""
     if not _is_ready:
-        raise HTTPException(503, "Not ready")
-    return {"ready": True}
+        raise HTTPException(503, "Not ready — RAG pipeline initializing")
+    return {"ready": True, "supervisor": _supervisor is not None}
 
 
 @app.get("/metrics", tags=["Operations"])
 def metrics(_key: str = Depends(verify_api_key)):
-    """Basic metrics (protected)."""
+    """Metrics endpoint (protected)."""
+    r = get_redis()
     return {
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
         "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
-        "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
+        "redis_connected": r is not None,
+        "rag_loaded": _supervisor is not None,
+        "monthly_budget_usd": settings.monthly_budget_usd,
+        "rate_limit_per_minute": settings.rate_limit_per_minute,
     }
 
 
@@ -268,14 +349,14 @@ def metrics(_key: str = Depends(verify_api_key)):
 # Graceful Shutdown
 # ─────────────────────────────────────────────────────────
 def _handle_signal(signum, _frame):
-    logger.info(json.dumps({"event": "signal", "signum": signum}))
+    logger.info(json.dumps({"event": "signal", "signum": signum, "action": "graceful_shutdown"}))
+
 
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
 if __name__ == "__main__":
     logger.info(f"Starting {settings.app_name} on {settings.host}:{settings.port}")
-    logger.info(f"API Key: {settings.agent_api_key[:4]}****")
     uvicorn.run(
         "app.main:app",
         host=settings.host,

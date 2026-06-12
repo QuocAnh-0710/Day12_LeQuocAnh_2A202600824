@@ -19,7 +19,8 @@ day12_ha-tang-cloud_va_deployment/
 │   └── production/                   #   Multi-stage + Docker Compose stack
 │
 ├── 03-cloud-deployment/            # Section 3: Cloud Options
-│   ├── railway/                    #   Deploy Railway (< 5 phút)
+│   ├── railway/            
+        #   Deploy Railway (< 5 phút)
 │   ├── render/                     #   Deploy Render + render.yaml
 │   └── production-cloud-run/         #   GCP Cloud Run + CI/CD
 │
